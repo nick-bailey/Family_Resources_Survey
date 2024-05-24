@@ -1,0 +1,500 @@
+---
+title: "FRS - emplt income deciles region"
+author: "Nick Bailey"
+date: '2024-05-24'
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# load packages
+# install.packages("pacman")  # first time only
+pacman::p_load(data.table, haven, lubridate, here, readxl, tidyverse, DescTools)
+
+
+```
+
+
+# Regional incomes
+
+Calculating deciles of gross income from employment for UK regions, for (i) all working age (16-65) and (ii) those 20-39 only. 
+
+
+### Reading in data from FRS
+
+The file reads in data from multiple years of the FRS/HBAI and multiple file types ('househol', 'adult', etc.), selecting relevant subsets of variables and combining each group into one file. It deals with problems created by formats/class of variables changing between years, and issues with changes in factor levels or labels. 
+
+
+### Data set up
+
+* all data sit within 'data_in' directory; 
+* FRS files are downloaded as one zip file for each year, and put into a directory named e.g. "FRS 1819" (financial year 2018-29). The relevant .sav files are then extracted (e.g. "adult.sav", "househol.sav") into the same directory; 
+* HBAI zip file contains all years and is downloaded to a directory "HBAI". The data files, in three-year groups, are downloaded and renamed e.g. "i1821e_2021prices.sav" is renamed "hbai 1821.sav". 
+
+
+## Input values
+In the following chunk, enter the desired years, files and variables to extract.
+
+```{r input}
+
+# set first and last years ('1993' = '1993/94', etc.)
+year_start <- 2021
+year_end   <- 2022
+
+# latest hbai year - taken from last year for latest hbai file
+year_end_hbai_max <- 2023
+
+
+# set list of files and variables to import
+list_data_frs <- list(list("househol", c('sernum', 'yearcode',
+                                         'country', 'gvtregn', 'gvtregno', 'brma')),
+                      list("adult", c('sernum', 'benunit', 'person', 
+                                      'age80', 
+                                      'incseo2',  # Adult - Gross Earnings from Self-Emp Opt 2
+                                      'inearns',  # Adult - Gross Income from Employment
+                                      'nincseo2', # Adult - Net Earnings from Self-Emp Opt 2
+                                      'ninearns' # Adult - Net Income from employment 
+                                      )), 
+                      list("hbai", c('sernum', 'benunit', 'person', 'year',
+                                     'gs_indwa')))
+
+
+## HBAI weights - variables guide
+# GS_INDAD	Value	SPI'd grossing factor for an adult 
+# GS_INDBU	Value	SPI'd grossing factor for the family (benefit unit) 
+# GS_INDCH	Value	SPI'd grossing factor for dependant children 
+# GS_INDHH	Value	SPI'd grossing factor for the household 
+# GS_INDPN	Value	SPI'd grossing factor for pensioners 
+# GS_INDPP	Value	SPI'd grossing factor for all individuals 
+# GS_INDWA	Value	SPI'd grossing factor for working-age adults 
+
+
+
+```
+
+
+
+This section takes start/end years and creates lists used by the function to select the relevant files. 
+
+```{r years}
+
+# make a list for reading files - '9394' for '1993/94', etc. [ex. hbai - see below]
+years <- data.frame(yr1 = as.character(year_start:year_end), 
+                    yr2 = as.character((year_start + 1):(year_end + 1))) %>% 
+  mutate(yr = paste0(substr(yr1, nchar(yr1)-1, nchar(yr1)), 
+                     substr(yr2, nchar(yr2)-1, nchar(yr2)))) %>% 
+  pull(yr)
+
+
+# round year start for hbai down to multiple of 3 (ignoring the 20xx part) i.e. 2009, 2012, etc.
+year_start_hbai <- 3 * ((year_start - 2000) %/% 3) + 2000
+# round year end for hbai down to multiple of 3 same way (i.e. 2019 to 2018 etc.)
+year_end_hbai   <- 3 * ((year_end - 2000) %/% 3) + 2000
+
+# make a list for reading hbai files - 0912 etc.
+years_hbai <- data.frame(yr1 = as.character(seq(year_start_hbai, year_end_hbai, by = 3)), 
+                         yr2 = as.character(seq(year_start_hbai+3, year_end_hbai+3, by = 3))) %>% 
+  mutate(yr2 = case_when(as.numeric(yr2) > year_end_hbai_max ~ as.character(year_end_hbai_max),
+                         TRUE ~ yr2)) %>% 
+  mutate(yr_hbai = paste0(substr(yr1, nchar(yr1)-1, nchar(yr1)), 
+                          substr(yr2, nchar(yr2)-1, nchar(yr2)))) %>% 
+  pull(yr_hbai)
+
+```
+
+
+## Data reading functions
+
+### Read FRS data
+This function reads in data from given group of '.sav' files (e.g. 'househol.sav') for a given group of years. It covers data from both 'FRS xxxx' directories and 'HBAI' directory. It is designed to identify problems with variables where the format ('class') changes between years, e.g. from numeric to factor. Where this occurs, the non-numeric versions are given a new name (with suffix to identify class e.g. '_factor'). This means data from different years can be combined; otherwise R throws an error trying to combine data of different classes in the same variable. The different variables can be merged later if desired. The function also stores the labels (levels) for every variable in every year so they can be checked for consistency between years at a later point and reconciled if necessary. 
+
+The function returns a list containing: 
+
+* one data frame with the data for all years for that group of .sav files; 
+* one data frame with information on each variable in the previous data frame, capturing type or class in each year as well as any labels for the factors; there are flags to indicate whether type/class changes and whether factor levels are the same in all years; 
+* one list containing each of the individual data frames read in from the .sav files (mainly for debugging so not stored).
+
+```{r read fn}
+
+# ## debug
+# sav_file_name <- 'hbai'
+
+fn_read_sav <- function(sav_file_name) {
+  # input sav_file_name is short string, e.g. 'hbai', 'househol' etc.
+  # 'years_fn' has format '0102' for '2001/02' etc.
+  #   unless file is hbai when year is 0912, 1215, etc.
+    
+    
+  ### make list of dfs from sav files
+  # empty list
+  list_df <- list()
+  
+  
+  if (sav_file_name != 'hbai') {
+    
+    # set years list to use
+    years_fn <- years
+    
+    # make string for files names by adding filetype suffix
+    sav_file_name <- paste0(sav_file_name, '.sav')
+    
+    # read in as list the .sav files for 'years_fn'
+    #  converting haven_labelled to factors
+    list_df <- map(years_fn, ~ as_factor(read_sav(here(paste0("data_in/FRS ", .x), sav_file_name))))
+    
+  } else {
+    
+    # set years list to use
+    years_fn <- years_hbai
+    
+    # read in as list the .sav files for 'years_fn'
+    #  converting haven_labelled to factors
+    list_df <- map(years_fn, ~ as_factor(read_sav(here('data_in/HBAI', paste0("hbai ", .x, '.sav')))))
+    
+  }
+  
+  # make colnames of dfs in list_df lower case
+  for (i in 1:length(list_df)) {
+    colnames(list_df[[i]]) <- tolower(colnames(list_df[[i]]))
+  }
+  
+  
+  ### capture info on each var in each year: class, value labels, etc.
+  # get class for var each year
+  #   NB expands number of classes by repetition to max number
+  #      which then gets concatenated
+  list_varclass <- list()
+  for (i in 1:length(list_df)) {
+  
+    # get class
+    temp <- lapply(list_df[[i]], class)
+    
+    # transpose and data frame
+    temp <- as.data.frame(t(as.data.frame(temp))) 
+    
+    # concatenate cols to one, add varname as col and reduce
+    temp$all <- apply(temp, 1, paste, collapse="; ")
+    temp$varname <- row.names(temp)
+    temp <- temp[c('varname', 'all')]
+    
+    # add year id to 'class'all'
+    names(temp)[2] <- paste0('all_', i)
+    
+    # add to list
+    list_varclass[[i]] <- temp
+    
+  }
+  
+  # make single df - all vars, all years
+  df_varclass <- as.data.frame(list_varclass[[1]])
+  if (length(list_varclass) > 1) {
+    
+    for (i in 2:length(list_varclass)) {
+        df_varclass <- merge(x=df_varclass, 
+                             y=as.data.frame(list_varclass[[i]]), 
+                             all=TRUE)
+    }
+    
+  }
+  
+  # make 'number_classes' for number of diff values (ignoring NA)
+  if (length(list_varclass) > 1) { 
+    df_varclass$number_classes <- apply(df_varclass[, -1], 1, 
+                                        function(x) length(unique(x[!is.na(x)]))) 
+  } else {
+    
+    df_varclass$number_classes <- 1
+    
+  }  
+    
+  # count of number of years where var missing
+  df_varclass <- df_varclass %>% 
+    mutate(years_var_missing = rowSums(is.na(df_varclass)))
+  
+  # make 'all_same_class' flag (ignoring missing years)
+  df_varclass <- df_varclass %>% 
+    mutate(all_same_class = (number_classes == 1)) 
+  
+  # make 'var_okay' flag (no missing years, always same class)
+  df_varclass <- df_varclass %>% 
+    mutate(var_okay = (number_classes == 1) & (years_var_missing == 0)) 
+  
+  # reorder
+  df_varclass <- df_varclass %>% 
+    select(varname, var_okay, all_same_class, number_classes, years_var_missing, everything())
+  
+  
+  ## put levels of all vars in all years in one df
+  # levels for all vars, all dfs
+  temp <- map(list_df, ~ sapply(.x, levels))
+  
+  # convert levels to single string for each var in each year
+  temp <- map(temp, ~ lapply(.x, toString))
+  
+  # make into list of dfs with levels as column
+  temp <- map(temp, ~ as.data.frame(t(as.data.frame(.x))))
+  
+  # rename col containing levels to reflect year, so it is unique
+  for (i in 1:length(temp)) {
+    colnames(temp[[i]]) <- paste0('levels_', i)
+  }
+  
+  # varnames to col
+  temp <- map(temp, ~ rownames_to_column(.x, var = 'varname'))
+  
+  # combine years into one df
+  temp2 <- as.data.frame(temp[[1]])
+  if (length(list_varclass) > 1) {
+    for (i in 2:length(temp)) {
+      temp2 <- merge(x=temp2, 
+                     y=as.data.frame(temp[[i]]), 
+                     by = 'varname',
+                     all=TRUE)
+    }
+  }
+  
+  # identify whether all levels same in every year or not
+    if (length(list_varclass) > 1) { 
+      
+      temp2$number_level_sets = apply(temp2[, -1], 1, function(x) length(unique(x[!is.na(x)])))
+      
+    } else {
+      
+      temp2$number_level_sets <- 1
+      
+    }
+  
+  
+  ## add levels data and number of sets of levels to varclass df
+  df_varclass <- merge(x=df_varclass, 
+                       y=temp2, 
+                       by = 'varname',
+                       all=TRUE)
+  
+  
+  ### in original data, add class to varname if the var is one where class changes over time
+  #   in this way, values for relevant years kept separate when data for diff years merged
+  #   (throws error otherwise)
+  #   'numeric' is the default which is left alone
+  #   can be sorted later if that variable is of interest
+  
+  # select vars with diff classes in diff years - numeric/Date/factor etc.
+  temp <- df_varclass %>% 
+    filter(all_same_class == FALSE) %>% 
+    select(-var_okay, -all_same_class, -years_var_missing)
+  
+  # list of cols with 'all_'
+  temp_cols <- colnames(temp)[grepl('all_', colnames(temp))]
+  
+  # list of the diff types/class within  'all_' cols which are NOT 'numeric'
+  temp2 <- temp %>% 
+    select(varname, all_of(temp_cols)) %>% 
+    pivot_longer(cols = all_of(temp_cols), 
+                 names_to = 'year', names_prefix = 'all_',
+                 values_to = 'type') %>% 
+    filter(!is.na(type) & type != "numeric") %>% 
+    pull(type) %>% 
+    unique()
+  
+  # df with vars/years where class changes over time and var is NOT numeric that year
+  temp <- temp %>% 
+    pivot_longer(cols = all_of(temp_cols), 
+                 names_to = 'year', names_prefix = 'all_',
+                 values_to = 'type') %>% 
+    filter(type %in% temp2) %>% 
+    select(varname, year, type)
+
+ 
+  # in original, rename var with suffix '_[type]'
+  #   so it is retained but separately - can sort later
+  #   only needed if nrow(temp) gt 0
+  if (nrow(temp) > 0) {
+    
+     for (i in 1:nrow(temp)) {
+
+      yr <- as.numeric(temp$year[i])
+      old_var <- temp$varname[i]
+      new_var <- paste0(old_var, '_', tolower(temp$type[i]))
+      colnames(list_df[[yr]])[colnames(list_df[[yr]]) == old_var] <- new_var
+    
+    }
+  }
+  
+
+  ### combine list of dfs into one (using cmd from data.table)
+  #    add 'yr_index' to distinguish years later
+  df_out <- rbindlist(list_df, fill = TRUE, 
+                      idcol = 'yr_index')
+  
+  # wrap dfs and list of dfs to return into single list
+  return_list <- list("df_out" = df_out, 
+                      "var_classes" = df_varclass, 
+                      "list_df" = list_df)
+  
+  # return
+  return(return_list)
+  
+}
+
+```
+
+
+## Read data
+The following sections read the data required from the relevant group of .sav files. 
+
+* df_XXXX - data from XXXX.sav files for years in range
+* df_XXXX2 - selected variables from from XXXX.sav files
+* df_XXXX_varclass - variable class and levels for all vars and all years
+* vars_XXXX_missing - list of target variables not found in .sav files
+
+
+```{r read data}
+
+
+for (i in 1:length(list_data_frs)) {
+  
+  # files to read - ith list, first item
+  temp_files <- list_data_frs[[i]][[1]]
+  
+  # run fn to read desired files
+  list_temp <- fn_read_sav(temp_files)
+  
+  # store output dfs with data and with variables classes and factor levels
+  assign(paste0("df_", temp_files), list_temp[[1]])
+  assign(paste0("df_", temp_files, "_varclass"), list_temp[[2]])
+  
+  
+  # desired subset of vars - ith list, second item
+  temp_vars <- c(list_data_frs[[i]][[2]], 
+                 'yr_index')   # all files have 'yr_index' for joining
+  
+  
+  # desired subset of vars present in df_xxx 
+  temp_vars_in <- temp_vars[temp_vars %in% colnames(list_temp[[1]])]
+  
+  # select desired subset from df_xxx where present
+  assign(paste0("df_", temp_files, "2"), (list_temp[[1]] %>% select(all_of(temp_vars_in))))
+  
+  
+  # desired subset not in df_xxx
+  temp_vars_not <- temp_vars[!(temp_vars %in% colnames(list_temp[[1]]))]
+  
+  # record desired vars not present in df_xxx
+  assign(paste0("vars_", temp_files, "_missing"), temp_vars_not)
+  
+}
+
+```
+
+
+## Combine data
+This part needs to be written to suit the join being made i.e. whether it is at household, person or benunit level. Use 'yr_index' along with 'sernum', 'benunit' and/or 'person' for FRS files. Use 'yearcode' for HBAI to link with 'yearcode' from household file.  
+
+```{r merge frs2}
+
+# create yearcode in hbai 
+# - yr_index doesn't work here as data in files with 3 yrs at a time
+df_hbai2 <- df_hbai2 %>% 
+  select(-yr_index)  %>%  # drop as misleading
+  mutate(yearcode = year + 1993) 
+
+# merge
+# - use 'yr_index' for frs files
+# - use 'yearcode' for hbai
+df_frs2 <- df_adult2 %>% 
+  left_join(df_househol2, 
+            by = c('sernum', 'yr_index')) %>% 
+  left_join(df_hbai2, 
+            by = c('sernum', 'benunit', 'person', 'yearcode')) %>% 
+  select(-yr_index, -year)
+
+
+# WA only file - only with employment income and valid weights
+df_frs2_wa <- df_frs2 %>%
+  filter(age80 %in% 16:65 &
+           ninearns > 0 &
+           gs_indwa > 0)
+
+
+```
+
+## Produce tables
+
+```{r tables all weighted}
+
+df_frs2_wa %>% 
+  group_by(gvtregn) %>% 
+  summarise(n = n(), 
+            p10 = Quantile(ninearns, weights = gs_indwa, probs = .10),
+            p20 = Quantile(ninearns, weights = gs_indwa, probs = .20),
+            p30 = Quantile(ninearns, weights = gs_indwa, probs = .30),
+            p40 = Quantile(ninearns, weights = gs_indwa, probs = .40),
+            p50 = Quantile(ninearns, weights = gs_indwa, probs = .50),
+            p60 = Quantile(ninearns, weights = gs_indwa, probs = .60),
+            p70 = Quantile(ninearns, weights = gs_indwa, probs = .70),
+            p80 = Quantile(ninearns, weights = gs_indwa, probs = .80),
+            p90 = Quantile(ninearns, weights = gs_indwa, probs = .90))
+
+df_temp <- df_frs2_wa %>% 
+  group_by(gvtregn) %>% 
+  summarise(n = n(), 
+            p10 = Quantile(ninearns, weights = gs_indwa, probs = .10),
+            p20 = Quantile(ninearns, weights = gs_indwa, probs = .20),
+            p30 = Quantile(ninearns, weights = gs_indwa, probs = .30),
+            p40 = Quantile(ninearns, weights = gs_indwa, probs = .40),
+            p50 = Quantile(ninearns, weights = gs_indwa, probs = .50),
+            p60 = Quantile(ninearns, weights = gs_indwa, probs = .60),
+            p70 = Quantile(ninearns, weights = gs_indwa, probs = .70),
+            p80 = Quantile(ninearns, weights = gs_indwa, probs = .80),
+            p90 = Quantile(ninearns, weights = gs_indwa, probs = .90))
+
+write_csv(df_temp, here('data_out', 'income_deciles_region_all_wa.csv'))
+
+```
+
+
+```{r tables 20-39 weighted}
+
+df_frs2_wa %>% 
+  filter(age80 %in% 20:39) %>% 
+  group_by(gvtregn) %>% 
+  summarise(n = n(), 
+            p10 = Quantile(ninearns, weights = gs_indwa, probs = .10),
+            p20 = Quantile(ninearns, weights = gs_indwa, probs = .20),
+            p30 = Quantile(ninearns, weights = gs_indwa, probs = .30),
+            p40 = Quantile(ninearns, weights = gs_indwa, probs = .40),
+            p50 = Quantile(ninearns, weights = gs_indwa, probs = .50),
+            p60 = Quantile(ninearns, weights = gs_indwa, probs = .60),
+            p70 = Quantile(ninearns, weights = gs_indwa, probs = .70),
+            p80 = Quantile(ninearns, weights = gs_indwa, probs = .80),
+            p90 = Quantile(ninearns, weights = gs_indwa, probs = .90))
+
+df_temp <- df_frs2_wa %>% 
+  filter(age80 %in% 20:39) %>% 
+  group_by(gvtregn) %>% 
+  summarise(n = n(), 
+            p10 = Quantile(ninearns, weights = gs_indwa, probs = .10),
+            p20 = Quantile(ninearns, weights = gs_indwa, probs = .20),
+            p30 = Quantile(ninearns, weights = gs_indwa, probs = .30),
+            p40 = Quantile(ninearns, weights = gs_indwa, probs = .40),
+            p50 = Quantile(ninearns, weights = gs_indwa, probs = .50),
+            p60 = Quantile(ninearns, weights = gs_indwa, probs = .60),
+            p70 = Quantile(ninearns, weights = gs_indwa, probs = .70),
+            p80 = Quantile(ninearns, weights = gs_indwa, probs = .80),
+            p90 = Quantile(ninearns, weights = gs_indwa, probs = .90))
+
+write_csv(df_temp, here('data_out', 'income_deciles_region_20_39.csv'))
+
+```
+
+
+## Session info
+
+```{r session}
+
+sessionInfo()
+
+```
+
